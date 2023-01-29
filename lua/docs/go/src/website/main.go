@@ -1,8 +1,8 @@
 package main
 
 import (
-	// "encoding/json"
 	"container/list"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -18,26 +18,31 @@ import (
 
 const (
 	contentDirectory = "/www"
+	templateDir      = "/www/templates"
 	templateFile     = "page.tmpl"
+	templateFileV2   = "pageV2.tmpl"
 	serverCertFile   = "/certs/server-cert-and-ca.pem"
 	serverKeyFile    = "/certs/server-key.pem"
 )
 
 var (
-	debug                 bool = true
-	pages                 map[string]*Page
-	pageTemplate          *template.Template
+	debug bool = true
+
+	pages   map[string]*Page
+	pagesV2 map[string]*Module
+
+	pageTemplate   *template.Template
+	pageTemplateV2 *template.Template
+
 	staticFileDirectories = []string{"js", "style", "audio", "images", "media"}
 	// key: the type, value: the page where it is described
 	typeRoutes map[string]string
 )
 
-//
 func redirectTLS(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "https://docs.cu.bzh:443"+r.RequestURI, http.StatusMovedPermanently)
 }
 
-//
 func main() {
 
 	// --------------------------------------------------
@@ -83,7 +88,36 @@ func httpHandler(w http.ResponseWriter, r *http.Request) {
 	path := cleanPath(r.URL.Path)
 
 	page, ok := pages[path]
-	if ok == false && path != "/" {
+
+	if ok {
+		if r.URL.Path != path {
+			fmt.Println(r.URL.Path, "!=", path)
+			http.Redirect(w, r, path, http.StatusMovedPermanently)
+			return
+		}
+
+		if page != nil {
+			_ = replyPage(w, page)
+			return
+		}
+	}
+
+	module, ok := pagesV2[path]
+
+	if ok {
+		if r.URL.Path != path {
+			fmt.Println(r.URL.Path, "!=", path)
+			http.Redirect(w, r, path, http.StatusMovedPermanently)
+			return
+		}
+
+		if module != nil {
+			_ = replyModule(w, module)
+			return
+		}
+	}
+
+	if path != "/" {
 		// not found, redirect to /
 		fmt.Println("not found:", path)
 
@@ -94,17 +128,6 @@ func httpHandler(w http.ResponseWriter, r *http.Request) {
 		}
 
 		http.Redirect(w, r, "/", http.StatusSeeOther)
-		return
-	}
-
-	if r.URL.Path != path {
-		fmt.Println(r.URL.Path, "!=", path)
-		http.Redirect(w, r, path, http.StatusMovedPermanently)
-		return
-	}
-
-	if page != nil {
-		_ = replyPage(w, page)
 		return
 	}
 
@@ -123,8 +146,20 @@ func replyPage(w http.ResponseWriter, page *Page) error {
 	return err
 }
 
+func replyModule(w http.ResponseWriter, module *Module) error {
+	err := pageTemplateV2.Execute(w, module)
+	if err != nil {
+		fmt.Println("🔥 error:", err.Error())
+	}
+	return err
+}
+
 func GetTitle(page *Page) string {
 	return page.GetTitle()
+}
+
+func GetTitleV2(module *Module) string {
+	return module.Name
 }
 
 func IsNotCreatableObject(page *Page) bool {
@@ -147,13 +182,23 @@ func parseContent() error {
 	var err error
 
 	pages = make(map[string]*Page)
+	pagesV2 = make(map[string]*Module)
+
 	typeRoutes = make(map[string]string)
 
 	if !fsutil.DirectoryExists(contentDirectory) {
 		return errors.New("content directory is missing")
 	}
 
-	templateFilePath := filepath.Join(contentDirectory, templateFile)
+	headTmplPath := filepath.Join(templateDir, "head.tmpl")
+	footerTmplPath := filepath.Join(templateDir, "footer.tmpl")
+	headerTmplPath := filepath.Join(templateDir, "header.tmpl")
+	menuTmplPath := filepath.Join(templateDir, "menu.tmpl")
+	sidemenuTmplPath := filepath.Join(templateDir, "sidemenu.tmpl")
+	contentblocksTmplPath := filepath.Join(templateDir, "contentblocks.tmpl")
+	typesTmplPath := filepath.Join(templateDir, "types.tmpl")
+
+	templateFilePath := filepath.Join(templateDir, templateFile)
 
 	pageTemplate = template.New("page.tmpl").Funcs(template.FuncMap{
 		"Join":                  strings.Join,
@@ -164,8 +209,24 @@ func parseContent() error {
 		"GetTypeRoute":          GetTypeRoute,
 	})
 
-	pageTemplate, err = pageTemplate.ParseFiles(templateFilePath)
+	pageTemplate, err = pageTemplate.ParseFiles(headTmplPath, footerTmplPath, headerTmplPath, menuTmplPath, sidemenuTmplPath, contentblocksTmplPath, typesTmplPath, templateFilePath)
+	if err != nil {
+		fmt.Println("🔥 error:", err.Error())
+		return err
+	}
 
+	templateFilePathV2 := filepath.Join(templateDir, templateFileV2)
+
+	pageTemplateV2 = template.New("pageV2.tmpl").Funcs(template.FuncMap{
+		"Join":                  strings.Join,
+		"GetTitle":              GetTitleV2,
+		"GetAnchorLink":         GetAnchorLink,
+		"SampleHasCodeAndMedia": SampleHasCodeAndMedia,
+		"IsNotCreatableObject":  IsNotCreatableObject,
+		"GetTypeRoute":          GetTypeRoute,
+	})
+
+	pageTemplateV2, err = pageTemplateV2.ParseFiles(headTmplPath, footerTmplPath, headerTmplPath, menuTmplPath, sidemenuTmplPath, contentblocksTmplPath, typesTmplPath, templateFilePathV2)
 	if err != nil {
 		fmt.Println("🔥 error:", err.Error())
 		return err
@@ -189,7 +250,7 @@ func parseContent() error {
 					return err
 				}
 
-				// example: from /www/index.json to /index.json
+				// example: from /www/index.yml to /index.yml
 				trimmedPath := strings.TrimPrefix(walkPath, contentDirectory)
 
 				page.ResourcePath = trimmedPath
@@ -206,6 +267,41 @@ func parseContent() error {
 				}
 
 				pages[cleanPath] = &page
+			}
+
+		} else if strings.HasSuffix(walkPath, ".json") { // JSON FILE
+
+			// check if path points to a regular file
+			exists := fsutil.RegularFileExists(walkPath)
+			if exists {
+
+				var module Module
+
+				file, err := os.Open(walkPath)
+				if err != nil {
+					return err
+				}
+
+				// example: from /www/index.json to /index.json
+				trimmedPath := strings.TrimPrefix(walkPath, contentDirectory)
+
+				module.ResourcePath = trimmedPath
+
+				cleanPath := cleanPath(trimmedPath)
+
+				err = json.NewDecoder(file).Decode(&module)
+
+				if err != nil {
+					module.Name = "Error"
+					module.Description = []*ContentBlock{
+						&ContentBlock{
+							Text: err.Error(),
+						},
+					}
+				}
+
+				fmt.Println("cleanPath:", cleanPath)
+				pagesV2[cleanPath] = &module
 			}
 		}
 
@@ -251,6 +347,10 @@ func parseContent() error {
 
 	for _, page := range pages {
 		page.Sanitize()
+	}
+
+	for _, module := range pagesV2 {
+		module.Sanitize()
 	}
 
 	fmt.Println("content parsed!")
